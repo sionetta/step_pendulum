@@ -12,3 +12,6 @@ desktop.ini
 
 # Promo materials (large video files) are not stored in the repository
 promo/
+
+# Internal project notes
+step_pendulum.md

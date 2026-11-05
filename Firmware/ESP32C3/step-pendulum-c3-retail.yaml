@@ -7,6 +7,7 @@ substitutions:
   steps_per_press: "100"   # steps per click
   daily_goal: "5000"       # top-up target
   daily_margin: "100"      # safety margin added on top of the goal
+  daily_steps_sensor: sensor.saaphone_daily_steps   # phone daily steps sensor in Home Assistant (Companion app)
   # --- servo power-down ---
   ap_password: "pendulum2026"   # printed on the device label, min. 8 characters
   idle_detach: 10s         # after a stop: let the pendulum ring down, then cut the servo signal
@@ -556,7 +557,7 @@ sensor:
   # Daily steps from the phone, used by the long-press run
   - platform: homeassistant
     id: ha_daily_steps
-    entity_id: sensor.saaphone_daily_steps
+    entity_id: ${daily_steps_sensor}
     internal: true
 
   - platform: template
