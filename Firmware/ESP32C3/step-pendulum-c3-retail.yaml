@@ -1,0 +1,590 @@
+substitutions:
+  name: step-pendulum
+  friendly_name: "Step Pendulum"
+  # --- button behaviour ---
+  press_gap: 3s            # pause after the last click that starts the run
+  long_press: 3s           # hold time that starts the "top-up to daily goal" run
+  steps_per_press: "100"   # steps per click
+  daily_goal: "5000"       # top-up target
+  daily_margin: "100"      # safety margin added on top of the goal
+  # --- servo power-down ---
+  ap_password: "pendulum2026"   # printed on the device label, min. 8 characters
+  idle_detach: 10s         # after a stop: let the pendulum ring down, then cut the servo signal
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true  # every unit gets its own name: step-pendulum-a1b2c3
+  project:
+    name: sionetta.step_pendulum
+    version: "1.0.0"
+  on_boot:
+    - priority: -100
+      then:
+        - servo.detach: srv  # no PWM on the servo pin while idle
+
+esp32:
+  board: esp32-c3-devkitm-1   # ESP32-C3 Super Mini
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  hardware_uart: USB_SERIAL_JTAG   # logs over the native USB-C port
+
+api:
+  encryption: {}             # no key in the firmware: Home Assistant sets a unique one when the device is added
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  output_power: 8.5dB       # fixes weak Wi-Fi on many C3 Super Mini boards; remove if not needed
+  # No home network in the firmware: on first power-up the device starts its own
+  # access point "step-pendulum-xxxxxx" right away; the customer enters the home Wi-Fi
+  # in the pop-up page. Later, if the home Wi-Fi is lost for ap_timeout, the AP comes back.
+  ap:
+    password: "${ap_password}"
+    ap_timeout: 30s
+
+captive_portal:
+
+# ---------- Factory reset: unplug/plug the power 5 times in a row (each within 10 s) ----------
+factory_reset:
+  resets_required: 5
+  max_delay: 10s
+  on_increment:
+    - lambda: 'ESP_LOGW("pendulum", "Factory reset counter %u/%u", x, target);'
+
+# ---------- Local web interface ----------
+web_server:
+  port: 80
+  version: 3
+  local: true                # JS/CSS stored on the chip: the page works without internet
+  sorting_groups:
+    - id: g_ctrl
+      name: "Управление"
+      sorting_weight: 1
+    - id: g_state
+      name: "Состояние"
+      sorting_weight: 2
+    - id: g_tune
+      name: "Настройки маятника"
+      sorting_weight: 3
+    - id: g_service
+      name: "Сервис"
+      sorting_weight: 4
+
+# ---------- Servo ----------
+output:
+  - platform: ledc     # hardware PWM: no servo jitter
+    id: servo_pwm
+    pin: GPIO4         # servo signal
+    frequency: 50 Hz
+
+  - platform: gpio     # onboard LED of the C3 Super Mini (GPIO8, active low)
+    id: led_out
+    pin:
+      number: GPIO8
+      inverted: true
+
+servo:
+  - id: srv
+    output: servo_pwm
+    auto_detach_time: 0s
+    transition_length: 0s
+
+# ---------- State ----------
+globals:
+  - id: running
+    type: bool
+    initial_value: 'false'
+  - id: stopping
+    type: bool
+    initial_value: 'false'
+  - id: phase          # 0..1 within one drive period
+    type: float
+    initial_value: '0'
+  - id: cur_amp        # current drive amplitude, degrees
+    type: float
+    initial_value: '0'
+  - id: steps_done
+    type: int
+    initial_value: '0'
+  - id: run_target     # target of the current run (set by Start / button)
+    type: int
+    initial_value: '0'
+  - id: last_ms
+    type: uint32_t
+    initial_value: '0'
+  # --- button state ---
+  - id: press_count
+    type: int
+    initial_value: '0'
+  - id: pending_steps
+    type: int
+    initial_value: '0'
+  - id: ignore_release
+    type: bool
+    initial_value: 'false'
+  - id: long_fired
+    type: bool
+    initial_value: 'false'
+
+# ---------- Settings in Home Assistant ----------
+number:
+  - platform: template
+    id: target_steps
+    name: "Target steps"
+    web_server:
+      sorting_group_id: g_ctrl
+      sorting_weight: 4
+    icon: mdi:shoe-print
+    min_value: 0
+    max_value: 50000
+    step: 100
+    initial_value: 5000
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: freq_hz
+    name: "Swing frequency"
+    web_server:
+      sorting_group_id: g_tune
+      sorting_weight: 1
+    unit_of_measurement: "Hz"
+    min_value: 0.3
+    max_value: 2.5
+    step: 0.01
+    initial_value: 0.9
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: steps_per_period
+    name: "Steps per swing period"
+    web_server:
+      sorting_group_id: g_tune
+      sorting_weight: 5
+    min_value: 1
+    max_value: 2
+    step: 1
+    initial_value: 2
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: amp_deg
+    name: "Servo amplitude"
+    web_server:
+      sorting_group_id: g_tune
+      sorting_weight: 2
+    unit_of_measurement: "°"
+    min_value: 0
+    max_value: 45
+    step: 0.5
+    initial_value: 12
+    optimistic: true
+    restore_value: true
+    mode: slider
+
+  - platform: template
+    id: ramp_s
+    name: "Ramp time"
+    web_server:
+      sorting_group_id: g_tune
+      sorting_weight: 3
+    icon: mdi:trending-up
+    unit_of_measurement: "s"
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 15
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: decay_s
+    name: "Decay time"
+    web_server:
+      sorting_group_id: g_tune
+      sorting_weight: 4
+    icon: mdi:trending-down
+    unit_of_measurement: "s"
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 5
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: trim_deg
+    name: "Servo center trim"
+    web_server:
+      sorting_group_id: g_tune
+      sorting_weight: 6
+    unit_of_measurement: "°"
+    min_value: -30
+    max_value: 30
+    step: 0.5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: slider
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !id(running);'
+          then:
+            - lambda: 'id(srv).write(x / 90.0f);'
+            - script.execute: idle_detach_timer
+
+# ---------- Scripts ----------
+script:
+  # Start a run of N steps (ignored if already running)
+  - id: start_run
+    mode: single
+    parameters:
+      steps: int
+    then:
+      - lambda: |-
+          if (id(running) || steps <= 0) return;
+          id(idle_detach_timer).stop();
+          id(run_target) = steps;
+          id(steps_done) = 0;
+          id(phase) = 0.0f;
+          id(cur_amp) = 0.0f;
+          id(stopping) = false;
+          id(last_ms) = millis();
+          id(running) = true;
+          ESP_LOGI("pendulum", "Start: target %d steps", steps);
+
+  # Cut the servo signal after a stop (servo goes limp, draws only idle current)
+  - id: idle_detach_timer
+    mode: restart
+    then:
+      - delay: ${idle_detach}
+      - if:
+          condition:
+            lambda: 'return !id(running);'
+          then:
+            - servo.detach: srv
+            - lambda: 'ESP_LOGI("pendulum", "Servo detached");'
+
+  # Short LED flash on every button press
+  - id: led_flash
+    mode: restart
+    then:
+      - output.turn_on: led_out
+      - delay: 80ms
+      - output.turn_off: led_out
+
+  # Long confirmation flash: the long-press threshold was reached
+  - id: led_long_ok
+    mode: restart
+    then:
+      - output.turn_on: led_out
+      - delay: 500ms
+      - output.turn_off: led_out
+
+  # Error: three quick blinks
+  - id: led_error
+    mode: restart
+    then:
+      - repeat:
+          count: 3
+          then:
+            - output.turn_on: led_out
+            - delay: 120ms
+            - output.turn_off: led_out
+            - delay: 120ms
+
+  # Pause after the last click -> start 100*n steps
+  - id: press_gap_timer
+    mode: restart
+    then:
+      - delay: ${press_gap}
+      - lambda: |-
+          id(pending_steps) = ${steps_per_press} * id(press_count);
+          id(press_count) = 0;
+      - if:
+          condition:
+            lambda: 'return id(pending_steps) > 0;'
+          then:
+            - script.execute:
+                id: start_run
+                steps: !lambda 'return id(pending_steps);'
+
+  # Button held long enough -> top up to the daily goal
+  - id: long_press_watch
+    mode: restart
+    then:
+      - delay: ${long_press}
+      - lambda: |-
+          id(long_fired) = true;
+          id(press_count) = 0;
+          float s = id(ha_daily_steps).state;
+          if (std::isnan(s)) {
+            ESP_LOGW("pendulum", "Daily steps sensor is not available, run cancelled");
+            id(pending_steps) = 0;
+          } else {
+            int n = (int) (${daily_goal} - s + ${daily_margin});
+            if (n > 50000) n = 50000;
+            id(pending_steps) = n;
+            ESP_LOGI("pendulum", "Daily steps %.0f -> run of %d steps", s, n);
+          }
+      - if:
+          condition:
+            lambda: 'return id(pending_steps) > 0;'
+          then:
+            - script.execute: led_long_ok
+            - script.execute:
+                id: start_run
+                steps: !lambda 'return id(pending_steps);'
+          else:
+            - script.execute: led_error
+
+# ---------- Controls in Home Assistant ----------
+button:
+  - platform: template
+    name: "Start"
+    web_server:
+      sorting_group_id: g_ctrl
+      sorting_weight: 1
+    icon: mdi:play
+    on_press:
+      - script.execute:
+          id: start_run
+          steps: !lambda 'return (int) id(target_steps).state;'
+
+  - platform: template
+    name: "Stop (smooth)"
+    web_server:
+      sorting_group_id: g_ctrl
+      sorting_weight: 2
+    icon: mdi:stop
+    on_press:
+      - lambda: |-
+          if (id(running)) id(stopping) = true;
+
+  - platform: template
+    name: "Stop now"
+    web_server:
+      sorting_group_id: g_ctrl
+      sorting_weight: 3
+    icon: mdi:alert-octagon
+    on_press:
+      - lambda: |-
+          id(running) = false;
+          id(stopping) = false;
+          id(cur_amp) = 0.0f;
+          id(idle_detach_timer).stop();
+          id(srv).detach();
+          ESP_LOGI("pendulum", "Emergency stop, servo detached");
+
+  - platform: restart
+    name: "Перезагрузка"
+    entity_category: config
+    web_server:
+      sorting_group_id: g_service
+      sorting_weight: 1
+
+  - platform: factory_reset
+    name: "Сброс к заводским (Wi-Fi и настройки)"
+    entity_category: config
+    web_server:
+      sorting_group_id: g_service
+      sorting_weight: 2
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP адрес"
+      web_server:
+        sorting_group_id: g_service
+        sorting_weight: 3
+    ssid:
+      name: "Сеть Wi-Fi"
+      web_server:
+        sorting_group_id: g_service
+        sorting_weight: 4
+  - platform: version
+    name: "Версия прошивки"
+    hide_timestamp: true
+    web_server:
+      sorting_group_id: g_service
+      sorting_weight: 6
+
+# ---------- Physical button: GPIO5 to GND ----------
+binary_sensor:
+  - platform: gpio
+    id: user_button
+    name: "Button"
+    internal: true
+    pin:
+      number: GPIO5
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 25ms
+      - delayed_off: 25ms
+    on_press:
+      - script.execute: led_flash
+      - script.stop: press_gap_timer
+      - if:
+          condition:
+            lambda: 'return id(running);'
+          then:
+            # a press during the swing -> smooth stop, the release is ignored
+            - lambda: |-
+                id(ignore_release) = true;
+                id(press_count) = 0;
+                id(stopping) = true;
+          else:
+            - lambda: |-
+                id(ignore_release) = false;
+                id(long_fired) = false;
+            - script.execute: long_press_watch
+    on_release:
+      - script.stop: long_press_watch
+      - if:
+          condition:
+            lambda: 'return !id(ignore_release) && !id(long_fired);'
+          then:
+            - lambda: 'id(press_count)++;'
+            - script.execute: press_gap_timer
+      - lambda: |-
+          id(ignore_release) = false;
+          id(long_fired) = false;
+
+  - platform: template
+    name: "Running"
+    web_server:
+      sorting_group_id: g_state
+      sorting_weight: 3
+    lambda: return id(running);
+
+  - platform: template
+    name: "Servo powered"
+    web_server:
+      sorting_group_id: g_state
+      sorting_weight: 4
+    icon: mdi:power-plug
+    lambda: return id(running) || id(idle_detach_timer).is_running();
+
+# ---------- Drive loop ----------
+interval:
+  # LED: short blink every 1.5 s while the device is not connected to the home Wi-Fi
+  - interval: 1500ms
+    then:
+      - if:
+          condition:
+            and:
+              - not: wifi.connected
+              - lambda: 'return !id(running) && !id(led_flash).is_running() && !id(led_long_ok).is_running() && !id(led_error).is_running();'
+          then:
+            - output.turn_on: led_out
+            - delay: 60ms
+            - output.turn_off: led_out
+
+  - interval: 20ms
+    then:
+      - lambda: |-
+          if (!id(running)) return;
+
+          uint32_t now = millis();
+          float dt = (now - id(last_ms)) / 1000.0f;
+          id(last_ms) = now;
+          if (dt > 0.1f) dt = 0.1f;   // guard against Wi-Fi hiccups
+
+          // Smooth amplitude ramp: separate times for swing-up and decay
+          const float A = id(amp_deg).state;
+          const float target = id(stopping) ? 0.0f : A;
+          const float base = std::max(A, 5.0f);
+          const float up_rate   = base / std::max(id(ramp_s).state, 1.0f);   // deg per s
+          const float down_rate = base / std::max(id(decay_s).state, 1.0f);  // deg per s
+          if (id(cur_amp) < target)
+            id(cur_amp) = std::min(target, id(cur_amp) + up_rate * dt);
+          else if (id(cur_amp) > target)
+            id(cur_amp) = std::max(target, id(cur_amp) - down_rate * dt);
+
+          // Phase and step counting (one drive period = one pendulum period)
+          id(phase) += id(freq_hz).state * dt;
+          if (id(phase) >= 1.0f) {
+            id(phase) -= 1.0f;
+            if (!id(stopping)) {
+              id(steps_done) += (int) id(steps_per_period).state;
+              if (id(steps_done) >= id(run_target)) {
+                id(stopping) = true;
+                ESP_LOGI("pendulum", "Target reached (%d), ramping down", id(steps_done));
+              }
+            }
+          }
+
+          float angle = id(trim_deg).state + id(cur_amp) * sinf(2.0f * M_PI * id(phase));
+          float cmd = std::max(-1.0f, std::min(1.0f, angle / 90.0f));
+          id(srv).write(cmd);
+
+          if (id(stopping) && id(cur_amp) <= 0.0f) {
+            id(running) = false;
+            id(stopping) = false;
+            id(srv).write(id(trim_deg).state / 90.0f);
+            id(idle_detach_timer).execute();
+            ESP_LOGI("pendulum", "Stopped, servo will be detached");
+          }
+
+# ---------- Status in Home Assistant ----------
+sensor:
+  - platform: wifi_signal
+    name: "Уровень Wi-Fi"
+    update_interval: 60s
+    web_server:
+      sorting_group_id: g_service
+      sorting_weight: 5
+
+  # Daily steps from the phone, used by the long-press run
+  - platform: homeassistant
+    id: ha_daily_steps
+    entity_id: sensor.saaphone_daily_steps
+    internal: true
+
+  - platform: template
+    name: "Steps done"
+    web_server:
+      sorting_group_id: g_state
+      sorting_weight: 1
+    icon: mdi:counter
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: return id(steps_done);
+
+  - platform: template
+    name: "Run target"
+    web_server:
+      sorting_group_id: g_state
+      sorting_weight: 2
+    icon: mdi:flag-checkered
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: return id(run_target);
+
+  - platform: template
+    name: "Drive amplitude now"
+    web_server:
+      sorting_group_id: g_state
+      sorting_weight: 5
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+    update_interval: 2s
+    lambda: return id(cur_amp);

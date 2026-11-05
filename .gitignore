@@ -1,0 +1,14 @@
+# ESPHome: build cache and private secrets
+.esphome/
+secrets.yaml
+
+# PlatformIO / editors / OS
+.pio/
+.vscode/
+*.bak
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Promo materials (large video files) are not stored in the repository
+promo/
